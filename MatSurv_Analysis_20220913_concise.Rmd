@@ -1,0 +1,1608 @@
+---
+title: "MATSURV"
+author: "Marc Henrion"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_depth: 4
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, error = FALSE)
+
+library(tidyverse)
+library(kableExtra)
+library(lubridate)
+library(gridExtra)
+library(MASS) # glm.nb
+library(tsModel) # harmonic
+library(kableExtra)
+library(forecast) # ma
+
+dateStr<-gsub(pattern="-",replacement="",Sys.Date())
+outDir<-paste(sep="","../output/",dateStr,"/")
+if(!exists(outDir)){dir.create(outDir,recursive=T)}
+
+#datePlotStart<-"2020-07-26"
+#datePlotEnd<-Sys.Date()
+
+datePlotStart<-"2020-09-06"
+datePlotEnd<-"2021-10-31"
+
+weekDict<-data.frame(
+  week=seq(ymd(datePlotStart),ymd(datePlotEnd),by="weeks")
+) %>%
+  mutate(
+    week_num=1:n()
+  )
+```
+
+## Load data
+
+Notes regarding the data tables:
+
+* `MS01_raw.csv` - this contains aggregate data for each facility
+* `MS02_raw.csv` - this is data from the enrolment form and contains individual-level data for every mother who was either a COVID-19 suspect, suffered a near-mis or died
+* `MS03_raw.csv` - daily records for patients from `MS02_raw.csv`; this has more than 1 records for mothers that were COVID-19 suspects or had near-misses; note that mothers that died later on have their death recorded in `MS03_raw.csv` and not `MS02_raw.csv`
+* `MS04_label.csv` - contains near-miss review data (all near-misses from `MS02_raw.csv` and `MS03_raw.csv`); not all facilities report these: only QECH, Thyolo and Chikwawa report these (though some other facilities also report some of these); in practice not all near-misses in QECH, Thyolo and Chikwawa are reviewed; if patient died before or during review, the review was not done; there is some delay in these data being pushed through to the data portal
+* `MS05_raw.csv` - MDSR (maternal death surveillance review); these reviews are done by experts; this should be done for all deaths from `MS02_raw.csv` and `MS03_raw.csv` but in practice not all deaths are reviewed; cause of death is reported as free text 
+
+```{r, fig.width=12, fig.height=6.75}
+dataDate<-"20220317"
+ms01<-read.csv(paste(sep="","../data/",dataDate,"/MS01_raw.csv")) # aggregate, facility-level data
+ms02<-read.csv(paste(sep="","../data/",dataDate,"/MS02_raw.csv")) # enrolment, individual-level data
+ms03<-read.csv(paste(sep="","../data/",dataDate,"/MS03_raw.csv")) # daily records for patients from MS02; more than record for mothers that were COVID suspects or near-misses; mothers that died later on have death recorded in MS03 not MS02
+ms04<-read.csv(paste(sep="","../data/",dataDate,"/MS04_label.csv")) # near-miss reviews (all near-misses from MS02 and MS03); not all facilities have these; mostly limited to QECH, Thyolo and Chikwawa; the idea is that all near-misses are reviewed but in practice this is incomplete; completion rates are meant to increase as study goes on
+ms05<-read.csv(paste(sep="","../data/",dataDate,"/MS05_raw.csv")) # maternal death surveillance review (by experts); death audits for all deaths from MS02 and MS03 (in practice data not complete; e.g. as of May 2021 only 222 out of 449 deaths reviewed)
+
+epiCurve<-read.csv(file="../data/20210830_EpiCurve/EPI_CURVE_Malawi Monitoring Cases_20200209 - Including 2 wave.csv")
+epiCurve$Date<-dmy(epiCurve$Date)
+
+epiCurveJHP<-read.csv("../data/20220318_EpiCurve/time_series_covid19_confirmed_global.csv") # downloaded from JHU CSSE here: https://github.com/CSSEGISandData/COVID-19/tree/master/csse_covid_19_data/csse_covid_19_time_series
+epiCurveJHP.deaths<-read.csv("../data/20220318_EpiCurve/time_series_covid19_deaths_global.csv") # downloaded from JHU CSSE here: https://github.com/CSSEGISandData/COVID-19/tree/master/csse_covid_19_data/csse_covid_19_time_series
+
+epiCurveJHP<-epiCurveJHP %>%
+  filter(Country.Region=="Malawi") %>%
+  dplyr::select(!c(Province.State,Country.Region,Lat,Long))
+epiCurveJHP<-data.frame(
+  Date=mdy(gsub(pattern="^X",replacement="",colnames(epiCurveJHP))),
+  totalConfirmedCumul=as.numeric(epiCurveJHP[1,])
+) %>%
+  mutate(
+    totalConfirmed=c(totalConfirmedCumul[1],totalConfirmedCumul[-1]-totalConfirmedCumul[-length(totalConfirmedCumul)])
+  )
+
+epiCurveJHP.deaths<-epiCurveJHP.deaths %>%
+  filter(Country.Region=="Malawi") %>%
+  dplyr::select(!c(Province.State,Country.Region,Lat,Long))
+epiCurveJHP.deaths<-data.frame(
+  Date=mdy(gsub(pattern="^X",replacement="",colnames(epiCurveJHP.deaths))),
+  totalConfirmedCumul.deaths=as.numeric(epiCurveJHP.deaths[1,])
+) %>%
+  mutate(
+    totalConfirmed.deaths=c(totalConfirmedCumul.deaths[1],totalConfirmedCumul.deaths[-1]-totalConfirmedCumul.deaths[-length(totalConfirmedCumul.deaths)])
+  )
+
+epiCurveJHP<-epiCurveJHP %>%
+  mutate(
+    totalConfirmedCumul.deaths=epiCurveJHP.deaths$totalConfirmedCumul.deaths[match(Date,epiCurveJHP.deaths$Date)],
+    totalConfirmed.deaths=epiCurveJHP.deaths$totalConfirmed.deaths[match(Date,epiCurveJHP.deaths$Date)]
+  ) %>%
+  mutate(
+    ma14_Cases=ma(totalConfirmed,order=14,centre=TRUE),
+    ma14_Deaths=ma(totalConfirmed.deaths,order=14,centre=TRUE)
+  )
+rm(epiCurveJHP.deaths)
+
+epiCurveJHP.long<-epiCurveJHP %>%
+  dplyr::select(Date,totalConfirmed,totalConfirmed.deaths) %>%
+  pivot_longer(cols=c(totalConfirmed,totalConfirmed.deaths),names_to="type",values_to="count") %>%
+  mutate(
+    type=case_when(
+      type=="totalConfirmed"~"Cases",
+      type=="totalConfirmed.deaths"~"Deaths",
+      TRUE~NA_character_
+    )
+  )
+epiCurveJHP.longMA<-epiCurveJHP %>%
+  dplyr::select(Date,ma14_Cases,ma14_Deaths) %>%
+  pivot_longer(cols=c(ma14_Cases,ma14_Deaths),names_to="type",values_to="MA14") %>%
+  mutate(
+    type=case_when(
+      type=="ma14_Cases"~"Cases",
+      type=="ma14_Deaths"~"Deaths",
+      TRUE~NA_character_
+    )
+  )
+
+epiCurveJHP.long<-epiCurveJHP.long %>%
+  mutate(
+    MA14=epiCurveJHP.longMA$MA14[match(paste(sep="_",Date,type),paste(sep="_",epiCurveJHP.longMA$Date,epiCurveJHP.longMA$type))]
+  )
+rm(epiCurveJHP.longMA)
+
+ms01$data_date<-ymd(ms01$data_date)
+ms02$data_date<-dmy(ms02$data_date)
+ms03$data_date<-dmy(ms03$data_date)
+ms04$data_date<-ymd(as.Date(dmy_hms(ms04$data_date)))
+ms05$data_date<-ymd(as.Date(dmy_hms(ms05$data_date)))
+
+# filtering out what appear to be misguided missing / N/A value encodings - check with David, Leo, Chikondi and the data managers
+for(var in c("birth","cs","md","nd","fsb","msb","anc","pnc","fpc","ccs","bas","conan","pb1","pb2")){
+  if(sum(ms01[,var]==999,na.rm=TRUE)>0){
+    print(paste(sep="","Variable ",var," has ",sum(ms01[,var]==999,na.rm=TRUE)," records with a value of 999. This is the code for N/A and these records have had their values set to NA."))
+    ms01[!is.na(ms01[,var]) & ms01[,var]==999,var]<-NA
+  }
+}
+
+datSummary<-data.frame(
+  dataTable=c("MS01","MS02","MS03","MS04","MS05"),
+  nObs=c(nrow(ms01),nrow(ms02),nrow(ms03),nrow(ms04),nrow(ms05)),
+  nVars=c(ncol(ms01),ncol(ms02),ncol(ms03),ncol(ms04),ncol(ms05)),
+  earliestDate=c(min(ms01$data_date,na.rm=T),min(ms02$data_date,na.rm=T),min(ms03$data_date,na.rm=T),min(ms04$data_date,na.rm=T),min(ms05$data_date,na.rm=T)),
+  latestDate=c(max(ms01$data_date,na.rm=T),max(ms02$data_date,na.rm=T),max(ms03$data_date,na.rm=T),max(ms04$data_date,na.rm=T),max(ms05$data_date,na.rm=T))
+)
+
+datSummary %>% kable(caption="Summary of the 5 MATSURV data tables.",col.names=c("Data table","number of observations","number of variables","earliest observation date","most recent observation date"),align = c("r","r","r","c","c")) %>%
+  kable_styling(full_width = FALSE)
+
+epiMalawi<-epiCurve %>%
+  filter(!(District %in% c("Mwanza PoE"))) %>%
+  group_by(Date) %>%
+  summarise(totalConfirmed=sum(Confirmed),totalConfirmed2=sum(as.integer(Confirmed.total),na.rm=T),.groups="drop")
+
+gEpi<-epiCurveJHP.long %>%
+  dplyr::filter(Date>=ymd(datePlotStart) & Date<=ymd(datePlotEnd)) %>%
+  ggplot() +
+  geom_bar(mapping=aes(x=Date,y=count),stat="identity") +
+  geom_line(mapping=aes(x=Date,y=MA14),col="steelblue",lwd=1) +
+  geom_vline(xintercept = ymd("2021-01-01"),lty=2,lwd=1,col="orange") +
+  geom_vline(xintercept = ymd("2021-06-20"),lty=2,lwd=1,col="orange") +
+  geom_vline(xintercept = ymd("2021-12-10"),lty=2,lwd=1,col="orange") +
+  labs(title="Daily confirmed COVID-19 cases (top) and deaths (bottom) in Malawi. Data from JHU CSSE.",caption="Grey bars show daily counts, blue lines show centered 14-day moving averages.\nShown in orange are the proposed time points for the interruptions in the segmented time series analysis: 2021-01-01, 2021-06-20 and 2021-12-10.\n2021-01-01 is a round date and which has the advantage of not conflating anything with the Christmas season.\nFurther, given this date is slightly after the start of the second wave, it allows for a lagged response.\nSimilarly 2021-06-20 and 2021-12-10 were chosen for the third and fourth waves.") +
+  xlab("Date") +
+  ylab("Total confirmed daily count.") +
+  xlim(c(ymd(datePlotStart),ymd(datePlotEnd))) +
+  facet_wrap(~type,nrow=2,scales = "free_y")
+
+pdf(width=20,height=20,file=paste(sep="",outDir,"EpiCurveByDistrict_WholeOfMalawi_",dateStr,".pdf"))
+print(gEpi)
+dev.off()
+
+#print(gEpi)
+```
+
+Note that for this analysis, we will restrict ourselves to the window from `r datePlotStart` to `r datePlotEnd`.
+
+### Weekly data reporting - need to aggregate?
+
+**Question:**
+
+`ms01_raw.csv` - what is being reported here: daily or weekly births? Looks like there was quite a bit of daily data, then became weekly? Weird peak in October when summarised at weekly level...
+
+```{r}
+gWeekly<-ms01 %>% 
+  mutate(date=floor_date(unit="weeks",ymd(data_date))) %>%
+  group_by(date) %>%
+  summarise(births = sum(birth,na.rm=T),.groups="drop") %>% 
+  ggplot(mapping=aes(ymd(date),y=births)) + 
+  geom_bar(stat="identity") +
+  xlab("date") +
+  xlim(c(ymd(datePlotStart),ymd(datePlotEnd)))
+
+gDaily<-ms01 %>%
+  group_by(data_date) %>%
+  summarise(births = sum(birth,na.rm=T),.groups="drop") %>%
+  ggplot(mapping=aes(ymd(data_date),y=births)) +
+  geom_bar(stat="identity") +
+  xlab("date") +
+  xlim(c(ymd(datePlotStart),ymd(datePlotEnd)))
+
+grid.arrange(gDaily,gWeekly,nrow=2)
+
+
+gWeekly<-ms01 %>% 
+  mutate(date=floor_date(unit="weeks",ymd(data_date))) %>%
+  group_by(date) %>%
+  summarise(mds = sum(md,na.rm=T),.groups="drop") %>% 
+  ggplot(mapping=aes(ymd(date),y=mds)) + 
+  geom_bar(stat="identity") +
+  ylab("Maternal deaths") +
+  xlab("date") +
+  xlim(c(ymd(datePlotStart),ymd(datePlotEnd)))
+
+gDaily<-ms01 %>%
+  group_by(data_date) %>%
+  summarise(mds = sum(md,na.rm=T),.groups="drop") %>%
+  ggplot(mapping=aes(ymd(data_date),y=mds)) +
+  geom_bar(stat="identity") +
+  ylab("Maternal deaths") +
+  xlab("date") +
+  xlim(c(ymd(datePlotStart),ymd(datePlotEnd)))
+
+grid.arrange(gDaily,gWeekly,nrow=2)
+```
+
+
+### Number of COVID-suspects and near misses
+
+**Question:**
+
+`nearmiss==0` - should this be treated as 'No'?
+
+```{r, fig.height=16,fig.width=10}
+table(ms02$covid,useNA="always") %>%
+  as.data.frame() %>%
+  mutate(CovidSuspect=case_when(Var1==0~"No",Var1==1~"Yes")) %>%
+  dplyr::select(CovidSuspect,Freq) %>%
+  kable(caption="Total number of COVID-19 suspect cases.",col.names=c("COVID-19 suspicion","Frequency"),row.names = FALSE) %>%
+  kable_styling(full_width = FALSE)
+
+table(ms02$nearmiss,useNA="always") %>%
+  as.data.frame() %>%
+  mutate(NearMiss=case_when(Var1==0~"No",Var1==1~"Yes")) %>%
+  dplyr::select(NearMiss,Freq) %>%
+  kable(caption="Total number of near misses.",col.names=c("Near miss","Frequency"),row.names = FALSE) %>%
+  kable_styling(full_width = FALSE)
+
+gCov<-ms02 %>%
+  group_by(data_date) %>%
+  summarise(mds = sum(covid,na.rm=T),.groups="drop") %>%
+  ggplot(mapping=aes(ymd(data_date),y=mds)) +
+  geom_bar(stat="identity") +
+  ylab("COVID-19 suspicions") +
+  xlab("date") +
+  xlim(c(ymd(datePlotStart),ymd(datePlotEnd)))
+
+gNearMiss<-ms02 %>%
+  group_by(data_date) %>%
+  summarise(mds = sum(nearmiss,na.rm=T),.groups="drop") %>%
+  ggplot(mapping=aes(ymd(data_date),y=mds)) +
+  geom_bar(stat="identity") +
+  ylab("Near misses") +
+  xlab("date") +
+  xlim(c(ymd(datePlotStart),ymd(datePlotEnd)))
+
+grid.arrange(nrow=3,gCov,gNearMiss,gEpi)
+```
+
+
+## Summary tables and graphs
+
+### Descriptive totals
+
+We first summarise the total institutional live births, maternal and neonatal deaths and ante- and post-natal clinic attendences.
+
+```{r}
+sumDatPeriods<-data.frame(
+  var=c("Live births","Maternal deaths","Neonatal deaths","Antenatal clinics","Postnatal clinics"),
+  WholeStudy=NA,
+  Period1=NA,
+  Period1Perc=NA,
+  Period2=NA,
+  Period2Perc=NA,
+  Period3=NA,
+  Period3Perc=NA
+)
+rownames(sumDatPeriods)<-c("Live births","Maternal deaths","Neonatal deaths","Antenatal clinics","Postnatal clinics")
+
+ms01_studyWindow<-ms01 %>%
+  dplyr::filter(data_date>=ymd(datePlotStart) & data_date<=ymd(datePlotEnd))
+
+sumDatPeriods["Live births","WholeStudy"]<-sum(ms01_studyWindow$birth,na.rm=T)
+sumDatPeriods["Live births","Period1"]<-sum(ms01_studyWindow$birth[ms01_studyWindow$data_date<ymd("2021-01-01")],na.rm=T)
+sumDatPeriods["Live births","Period2"]<-sum(ms01_studyWindow$birth[ms01_studyWindow$data_date>=ymd("2021-01-01") & ms01_studyWindow$data_date<ymd("2021-06-20")],na.rm=T)
+sumDatPeriods["Live births","Period3"]<-sum(ms01_studyWindow$birth[ms01_studyWindow$data_date>=ymd("2021-06-20")],na.rm=T)
+
+sumDatPeriods["Maternal deaths","WholeStudy"]<-sum(ms01_studyWindow$md,na.rm=T)
+sumDatPeriods["Maternal deaths","Period1"]<-sum(ms01_studyWindow$md[ms01_studyWindow$data_date<ymd("2021-01-01")],na.rm=T)
+sumDatPeriods["Maternal deaths","Period2"]<-sum(ms01_studyWindow$md[ms01_studyWindow$data_date>=ymd("2021-01-01") & ms01_studyWindow$data_date<ymd("2021-06-20")],na.rm=T)
+sumDatPeriods["Maternal deaths","Period3"]<-sum(ms01_studyWindow$md[ms01_studyWindow$data_date>=ymd("2021-06-20")],na.rm=T)
+
+sumDatPeriods["Neonatal deaths","WholeStudy"]<-sum(ms01_studyWindow$nd,na.rm=T)
+sumDatPeriods["Neonatal deaths","Period1"]<-sum(ms01_studyWindow$nd[ms01_studyWindow$data_date<ymd("2021-01-01")],na.rm=T)
+sumDatPeriods["Neonatal deaths","Period2"]<-sum(ms01_studyWindow$nd[ms01_studyWindow$data_date>=ymd("2021-01-01") & ms01_studyWindow$data_date<ymd("2021-06-20")],na.rm=T)
+sumDatPeriods["Neonatal deaths","Period3"]<-sum(ms01_studyWindow$nd[ms01_studyWindow$data_date>=ymd("2021-06-20")],na.rm=T)
+
+sumDatPeriods["Antenatal clinics","WholeStudy"]<-sum(ms01_studyWindow$anc,na.rm=T)
+sumDatPeriods["Antenatal clinics","Period1"]<-sum(ms01_studyWindow$anc[ms01_studyWindow$data_date<ymd("2021-01-01")],na.rm=T)
+sumDatPeriods["Antenatal clinics","Period2"]<-sum(ms01_studyWindow$anc[ms01_studyWindow$data_date>=ymd("2021-01-01") & ms01_studyWindow$data_date<ymd("2021-06-20")],na.rm=T)
+sumDatPeriods["Antenatal clinics","Period3"]<-sum(ms01_studyWindow$anc[ms01_studyWindow$data_date>=ymd("2021-06-20")],na.rm=T)
+
+sumDatPeriods["Postnatal clinics","WholeStudy"]<-sum(ms01_studyWindow$pnc,na.rm=T)
+sumDatPeriods["Postnatal clinics","Period1"]<-sum(ms01_studyWindow$pnc[ms01_studyWindow$data_date<ymd("2021-01-01")],na.rm=T)
+sumDatPeriods["Postnatal clinics","Period2"]<-sum(ms01_studyWindow$pnc[ms01_studyWindow$data_date>=ymd("2021-01-01") & ms01_studyWindow$data_date<ymd("2021-06-20")],na.rm=T)
+sumDatPeriods["Postnatal clinics","Period3"]<-sum(ms01_studyWindow$pnc[ms01_studyWindow$data_date>=ymd("2021-06-20")],na.rm=T)
+
+sumDatPeriods$Period1Perc=round(digits=1,100*sumDatPeriods$Period1/sumDatPeriods$WholeStudy)
+sumDatPeriods$Period2Perc=round(digits=1,100*sumDatPeriods$Period2/sumDatPeriods$WholeStudy)
+sumDatPeriods$Period3Perc=round(digits=1,100*sumDatPeriods$Period3/sumDatPeriods$WholeStudy)
+
+sumDatPeriods<-format(big.mark=",",scientific=FALSE,sumDatPeriods)
+
+sumDatPeriods$Period1<-paste(sep="",sumDatPeriods$Period1," (",sumDatPeriods$Period1Perc,"%)")
+sumDatPeriods$Period2<-paste(sep="",sumDatPeriods$Period2," (",sumDatPeriods$Period2Perc,"%)")
+sumDatPeriods$Period3<-paste(sep="",sumDatPeriods$Period3," (",sumDatPeriods$Period3Perc,"%)")
+
+sumDatPeriods %>%
+  dplyr::select(!c(var,contains("Perc"))) %>%
+  kable(row.names=TRUE,col.names=c("Whole study period",paste(sep=" - ",datePlotStart,"2020-12-31"),paste(sep=" - ","2021-01-01","2021-06-19"),paste(sep=" - ","2021-06-20",datePlotEnd))) %>%
+  kable_styling(full_width=FALSE)
+```
+
+
+### Patient characteristics summary table
+
+(TBD)
+
+### Time plots
+
+Note: breech births do not seem to be tracked? Variable `bb` is missing from data frame.
+
+```{r}
+varNames <- c(
+  `births` = "Live births",
+  `css` = "Cesarean sections",
+  `ibs` = "Instrument deliveries",
+  `mds` = "Maternal deaths",
+  `nds` = "Neonatal deaths",
+  `sbs` = "Still births",
+  `fsbs` = "Still births (fresh)",
+  `msbs` = "Still births (macerated)",
+  `ancs` = "Antenatal clinic visits",
+  `pncs` = "Postnatal clinic visits",
+  `fpcs` = "Family planning clinic visits",
+  `ccss` = "Cervical cancer screenings",
+  `bass` = "Birth asphyxias",
+  `conans` = "Conenital abnormalities",
+  `pb1s` = "Birth weight < 1,000g",
+  `pb2s` = "Birth weight >= 1,000g, < 1,500g",
+  `ohmds` = "Out-of-hospital maternal deaths",
+  `ohnds` = "Out-of-hospital neonatal deaths",
+  `ohfsbs` = "Out-of-hospital still births (fresh)",
+  `ohmsbs` = "Out-of-hospital still births (macerated)",
+  `numdocs` = "Number of doctors",
+  `numcos` = "Number of clinical officers",
+  `numnurs` = "Number of nurses"
+)
+
+ms01Sum<-ms01 %>% 
+  mutate(date=floor_date(unit="weeks",ymd(data_date))) %>%
+  group_by(date) %>%
+  summarise(
+    births = sum(birth,na.rm=T), # live births
+    css = sum(cs,na.rm=T), # Cesarean sections
+    ibs = sum(ib,na.rm=T), # instrument deliveries
+    mds = sum(md,na.rm=T), # maternal deaths
+    nds = sum(nd,na.rm=T), # neonatal deaths
+    sbs = sum(fsb+msb,na.rm=T), # all still births
+    fsbs = sum(fsb,na.rm=T), # fresh still births
+    msbs = sum(msb,na.rm=T), # macerated still births
+    ancs = sum(anc,na.rm=T), # antenatal clinic visits
+    pncs = sum(pnc,na.rm=T), # postnatal clinic visits
+    fpcs = sum(fpc,na.rm=T), # family planning clinic visits
+    ccss = sum(ccs,na.rm=T), # cervical cancer screenings
+    bass = sum(bas,na.rm=T), # birth asphyxias
+    conans = sum(conan,na.rm=T), # congenital abnormalities
+    pb1s = sum(pb1,na.rm=T), # live births < 1,000g
+    pb2s = sum(pb2,na.rm=T), # live births >=1,000g, < 1,500g
+    ohmds = sum(ohmd,na.rm=T), # out-of-hospital maternal deaths
+    ohnds = sum(ohnd,na.rm=T), # out-of-hospital neonatal deaths
+    ohfsbs = sum(ohfsb,na.rm=T), # out-of-hospital fresh still births
+    ohmsbs = sum(ohmsb,na.rm=T), # out-of-hospital macerated still births
+    numdocs = sum(numdoc,na.rm=T), # number of doctors
+    numcos = sum(numco,na.rm=T), # number of clinical officers
+    numnurs = sum(numnur,na.rm=T), # number of nurses
+    .groups="drop") %>%
+  pivot_longer(cols=c(births,css,ibs,mds,nds,sbs,fsbs,msbs,ancs,pncs,fpcs,ccss,bass,conans,pb1s,pb2s,ohmds,ohnds,ohfsbs,ohmsbs,numdocs,numcos,numnurs),names_to="metric",values_to="weeklyCounts") %>%
+  mutate(metric=fct_relevel(metric,c("births","css","ibs","mds","nds","sbs","fsbs","msbs","ancs","pncs","fpcs","ccss","bass","conans","pb1s","pb2s","ohmds","ohnds","ohfsbs","ohmsbs","numdocs","numcos","numnurs")))
+```
+
+#### Births
+
+```{r, fig.height=9, fig.width=12}
+ms01Sum %>% 
+  filter(metric %in% c("births","css","ibs")) %>%
+  ggplot(mapping=aes(ymd(date),y=weeklyCounts)) + 
+  geom_bar(stat="identity") +
+  ylab("frequency") +
+  xlab("date") +
+  xlim(c(ymd(datePlotStart),ymd(datePlotEnd))) +
+  labs(title="Weekly reported births.",caption="Data were aggregated by calendar week, with the start date of each week identifying the week.\nOrange dashed lines indicate the chosen interruption dates.") +
+  geom_vline(xintercept = ymd("2021-01-01"),lty=2,lwd=1,col="orange") +
+  geom_vline(xintercept = ymd("2021-06-20"),lty=2,lwd=1,col="orange") +
+  #geom_vline(xintercept = ymd("2021-12-10"),lty=2,lwd=1,col="orange") +
+  facet_wrap(~metric,nrow=3,scales="free_y",labeller = as_labeller(varNames))
+```
+
+#### Deaths
+
+```{r, fig.height=12, fig.width=12}
+ms01Sum %>% 
+  filter(metric %in% c("mds","nds","fsbs","msbs")) %>%
+  ggplot(mapping=aes(ymd(date),y=weeklyCounts)) + 
+  geom_bar(stat="identity") +
+  ylab("frequency") +
+  xlab("date") +
+  xlim(c(ymd(datePlotStart),ymd(datePlotEnd))) +
+  labs(title="Weekly reported deaths.",caption="Data were aggregated by calendar week, with the start date of each week identifying the week.\nOrange dashed lines indicate the chosen interruption dates.") +
+  geom_vline(xintercept = ymd("2021-01-01"),lty=2,lwd=1,col="orange") +
+  geom_vline(xintercept = ymd("2021-06-20"),lty=2,lwd=1,col="orange") +
+  #geom_vline(xintercept = ymd("2021-12-10"),lty=2,lwd=1,col="orange") +
+  facet_wrap(~metric,nrow=4,scales="free_y",labeller = as_labeller(varNames))
+```
+
+#### Issues during birth
+
+```{r, fig.height=12, fig.width=12}
+ms01Sum %>% 
+  filter(metric %in% c("bass","conans","pb1s","pb2s")) %>%
+  ggplot(mapping=aes(ymd(date),y=weeklyCounts)) + 
+  geom_bar(stat="identity") +
+  ylab("frequency") +
+  xlab("date") +
+  xlim(c(ymd(datePlotStart),ymd(datePlotEnd))) +
+  labs(title="Weekly reported birth issues.",caption="Data were aggregated by calendar week, with the start date of each week identifying the week.\nOrange dashed lines indicate the chosen interruption dates.") +
+  geom_vline(xintercept = ymd("2021-01-01"),lty=2,lwd=1,col="orange") +
+  geom_vline(xintercept = ymd("2021-06-20"),lty=2,lwd=1,col="orange") +
+  geom_vline(xintercept = ymd("2021-12-10"),lty=2,lwd=1,col="orange") +
+  facet_wrap(~metric,nrow=4,scales="free_y",labeller = as_labeller(varNames))
+```
+
+#### Clinics
+
+```{r, fig.height=12, fig.width=12}
+ms01Sum %>% 
+  filter(metric %in% c("ancs","pncs","fpcs","ccss")) %>%
+  ggplot(mapping=aes(ymd(date),y=weeklyCounts)) + 
+  geom_bar(stat="identity") +
+  ylab("frequency") +
+  xlab("date") +
+  xlim(c(ymd(datePlotStart),ymd(datePlotEnd))) +
+  labs(title="Weekly reported clinic visits.",caption="Data were aggregated by calendar week, with the start date of each week identifying the week.\nOrange dashed lines indicate the chosen interruption dates.") +
+  geom_vline(xintercept = ymd("2021-01-01"),lty=2,lwd=1,col="orange") +
+  geom_vline(xintercept = ymd("2021-06-20"),lty=2,lwd=1,col="orange") +
+  #geom_vline(xintercept = ymd("2021-12-10"),lty=2,lwd=1,col="orange") +
+  facet_wrap(~metric,nrow=4,scales="free_y",labeller = as_labeller(varNames))
+```
+
+#### Out-of-hospital deaths
+
+```{r, fig.height=12, fig.width=12}
+ms01Sum %>% 
+  filter(metric %in% c("ohmds","ohnds","ohfsbs","ohmsbs")) %>%
+  ggplot(mapping=aes(ymd(date),y=weeklyCounts)) + 
+  geom_bar(stat="identity") +
+  ylab("frequency") +
+  xlab("date") +
+  xlim(c(ymd(datePlotStart),ymd(datePlotEnd))) +
+  labs(title="Weekly reported deaths.",caption="Data were aggregated by calendar week, with the start date of each week identifying the week.\nOrange dashed lines indicate the chosen interruption dates.") +
+  geom_vline(xintercept = ymd("2021-01-01"),lty=2,lwd=1,col="orange") +
+  geom_vline(xintercept = ymd("2021-06-20"),lty=2,lwd=1,col="orange") +
+  geom_vline(xintercept = ymd("2021-12-10"),lty=2,lwd=1,col="orange") +
+  facet_wrap(~metric,nrow=4,scales="free_y",labeller = as_labeller(varNames))
+```
+
+## Segmented regression analysis
+
+```{r}
+ms01_weekly<-ms01 %>% 
+  mutate(date=floor_date(unit="weeks",ymd(data_date))) %>%
+  group_by(date) %>%
+  summarise(
+    births = sum(birth,na.rm=T), # live births
+    css = sum(cs,na.rm=T), # Cesarean sections
+    ibs = sum(ib,na.rm=T), # instrument deliveries
+    mds = sum(md,na.rm=T), # maternal deaths
+    nds = sum(nd,na.rm=T), # neonatal deaths
+    sbs = sum(fsb+msb,na.rm=T), # all still births
+    fsbs = sum(fsb,na.rm=T), # fresh still births
+    msbs = sum(msb,na.rm=T), # macerated still births
+    ancs = sum(anc,na.rm=T), # antenatal clinic visits
+    pncs = sum(pnc,na.rm=T), # postnatal clinic visits
+    fpcs = sum(fpc,na.rm=T), # family planning clinic visits
+    ccss = sum(ccs,na.rm=T), # cervical cancer screenings
+    bass = sum(bas,na.rm=T), # birth asphyxias
+    conans = sum(conan,na.rm=T), # congenital abnormalities
+    pb1s = sum(pb1,na.rm=T), # live births < 1,000g
+    pb2s = sum(pb2,na.rm=T), # live births >=1,000g, < 1,500g
+    ohmds = sum(ohmd,na.rm=T), # out-of-hospital maternal deaths
+    ohnds = sum(ohnd,na.rm=T), # out-of-hospital neonatal deaths
+    ohfsbs = sum(ohfsb,na.rm=T), # out-of-hospital fresh still births
+    ohmsbs = sum(ohmsb,na.rm=T), # out-of-hospital macerated still births
+    numdocs = sum(numdoc,na.rm=T), # number of doctors
+    numcos = sum(numco,na.rm=T), # number of clinical officers
+    numnurs = sum(numnur,na.rm=T), # number of nurses
+    .groups="drop") %>%
+  dplyr::filter(date>=datePlotStart & date<=datePlotEnd)
+  
+ms01_weekly<-ms01_weekly[order(ms01_weekly$date),] %>% 
+  mutate(
+    week_num=weekDict$week_num[match(date,weekDict$week)],
+    covid=ifelse(date<"2021-01-01",0,1),
+    covid2=ifelse(date<"2021-06-20",0,1),
+    covid3=ifelse(date<"2021-12-10",0,1)
+  )
+covid_week<-min(ms01_weekly$date[ms01_weekly$covid==1])
+covid2_week<-min(ms01_weekly$date[ms01_weekly$covid2==1])
+covid3_week<-min(ms01_weekly$date[ms01_weekly$covid3==1])
+covid_week_num<-min(ms01_weekly$week_num[ms01_weekly$covid==1])
+covid2_week_num<-min(ms01_weekly$week_num[ms01_weekly$covid2==1])
+covid3_week_num<-min(ms01_weekly$week_num[ms01_weekly$covid3==1])
+
+ms01_weekly<-ms01_weekly %>%
+  mutate(
+    week_num_postcovid=ifelse(covid==0,0,week_num-covid_week_num+1),
+    week_num_postcovid2=ifelse(covid2==0,0,week_num-covid2_week_num+1),
+    week_num_postcovid3=ifelse(covid3==0,0,week_num-covid3_week_num+1)
+  )
+
+## REMOVE THIS LINE ONCE DATA FOR 2021-12-05 is fixed!!!
+#ms01_weekly<-ms01_weekly[-nrow(ms01_weekly),]
+```
+
+```{r}
+modFunBirthOffset<-function(dat,predRange=c("2020-07-26 00:00","2021-09-30 23:59"),var,varNameAnnot,ylabAnnot,B=1e3,doBS=TRUE,covidDate="2021-01-01"){
+  dat<-dat %>%
+    mutate(sr=get(var))
+
+  modIntercept <-try(silent=TRUE,glm.nb(as.formula(paste(sep="",var," ~ 1 + offset(log(births))")), data=dat))
+    
+  modCF <-try(silent=TRUE,glm.nb(as.formula(paste(sep="",var," ~ week_num + offset(log(births))")), data=dat %>% dplyr::filter(week_num<covid_week_num)))
+  # modSR <-glm.nb(as.formula(paste(sep="",var," ~ covid + week_num + week_num_postcovid + offset(log(births))")), data=dat)
+  # modSR.season <-glm.nb(as.formula(paste(sep="",var," ~ covid + week_num + week_num_postcovid + harmonic(week_num,2,52) + offset(log(births))")), data=dat)
+  modSRcov2 <-try(silent=TRUE,glm.nb(as.formula(paste(sep="",var," ~ covid + covid2 + week_num + week_num_postcovid + week_num_postcovid2 + offset(log(births))")), data=dat))
+  # modSRcov3 <-glm.nb(as.formula(paste(sep="",var," ~ covid + covid2 + covid3 + week_num + week_num_postcovid + week_num_postcovid2 + week_num_postcovid3 + offset(log(births))")), data=dat)
+  
+  if(class(modCF)!="try-error" & class(modSRcov2)!="try-error"){
+    pseudoR2<-1-logLik(modSRcov2)/logLik(modIntercept)
+    
+    if(doBS){
+      #tmp<-coef(modSRcov3)
+      tmp<-coef(modSRcov2)
+      covidWaves12Effect<-tmp["covid"]-tmp["covid2"]
+      covidWaves12EffectBS<-numeric(0)
+      
+      modCFBS<-list()
+      
+      for(b in 1:B){
+        modCFBS[[b]]<-try(stop("error"),silent=TRUE)
+        modBS<-try(stop("error"),silent=TRUE)
+        while(class(modCFBS[[b]])=="try-error" | class(modBS)=="try-error"){
+          datBS<-dat[sample(x=1:nrow(dat),size=nrow(dat),replace=TRUE),]
+          modCFBS[[b]]<-try(silent=TRUE,glm.nb(as.formula(paste(sep="",var," ~ week_num + offset(log(births))")), data=datBS %>% dplyr::filter(week_num<covid_week_num)))
+          #modBS <-glm.nb(as.formula(paste(sep="",var," ~ covid + covid2 + covid3 + week_num + week_num_postcovid + week_num_postcovid2 + week_num_postcovid3 + offset(log(births))")), data=datBS)
+          modBS <-try(silent=TRUE,glm.nb(as.formula(paste(sep="",var," ~ covid + covid2 + week_num + week_num_postcovid + week_num_postcovid2 + offset(log(births))")), data=datBS))
+        }
+        tmp<-coef(modBS)
+        covidWaves12EffectBS<-c(covidWaves12EffectBS,tmp["covid"]-tmp["covid2"])
+      }
+      
+      covidWaves12EffectCI<-quantile(covidWaves12EffectBS,probs=c(0.025,0.975))
+    }
+
+    predDfCov2<-data.frame(
+      date=seq(ymd_hm(predRange[1]),ymd_hm(predRange[2]),by="hour"),
+      births=3500
+    ) %>%
+      mutate(week_num=(1:n() +7*24-1)/(7*24)) %>%
+      mutate(
+        covid=ifelse(week_num<covid_week_num,0,1),
+        covid2=ifelse(week_num<covid2_week_num,0,1)
+      ) %>%
+      mutate(
+        week_num_postcovid=ifelse(covid==0,0,week_num-covid_week_num),
+        week_num_postcovid2=ifelse(covid2==0,0,week_num-covid2_week_num)
+      ) %>%
+      as_tibble()
+    
+    predDfCov2<-predDfCov2 %>%
+      mutate(
+        srPredLink=NA,
+        srPredLinkSE=NA
+      )
+    
+    predTmp<-try(silent=TRUE,predict(modSRcov2,newdata=predDfCov2,type="link",se.fit=T))
+    if(class(predTmp)!="try-error"){
+      predDfCov2$srPredLink<-predTmp$fit
+      predDfCov2$srPredLinkSE<-predTmp$se.fit
+    }
+    
+    predDfCov2<-predDfCov2 %>%
+      mutate(
+        srPred=exp(srPredLink),
+        srPredLow=exp(srPredLink-qnorm(0.975)*srPredLinkSE),
+        srPredUpp=exp(srPredLink+qnorm(0.975)*srPredLinkSE)
+      )
+    
+    predDfCF<-data.frame(
+      date=seq(ymd_hm(predRange[1]),ymd_hm(predRange[2]),by="hour"),
+      births=3500
+    ) %>%
+      mutate(
+        week_num=(1:n() +7*24-1)/(7*24)
+      ) %>%
+      as_tibble() %>%
+      filter(week_num>=covid_week_num)
+    
+    predDfCF<-predDfCF %>%
+      mutate(
+        srPredLink=NA,
+        srPredLinkSE=NA,
+      )
+    
+    predTmp<-try(silent=TRUE,predict(modCF,newdata=predDfCF,type="link",se.fit=T))
+    if(class(predTmp)!="try-error"){
+      predDfCF$srPredLink<-predTmp$fit
+      predDfCF$srPredLinkSE<-predTmp$se.fit
+    }
+    
+    predDfCF<-predDfCF %>%
+      mutate(
+        srPred=exp(srPredLink),
+        srPredLow=exp(srPredLink-qnorm(0.975)*srPredLinkSE),
+        srPredUpp=exp(srPredLink+qnorm(0.975)*srPredLinkSE)
+      )
+    
+    predDfCFWeekly<-data.frame(
+      date=seq(ymd_hm(predRange[1]),ymd_hm(predRange[2]),by="weeks")
+    ) %>%
+      mutate(week_num=1:n()) %>%
+      mutate(
+        births=dat$births[match(week_num,dat$week_num)]
+      ) %>%
+      as_tibble() %>%
+      filter(week_num>=covid_week_num)
+    
+    predDfCFWeekly<-predDfCFWeekly %>%
+      mutate(
+        srPredLink=NA,
+        srPredLinkSE=NA
+      )
+    
+    predTmp<-try(silent=TRUE,predict(modCF,newdata=predDfCFWeekly,type="link",se.fit=T))
+    if(class(predTmp)!="try-error"){
+      predDfCFWeekly$srPredLink<-predTmp$fit
+      predDfCFWeekly$srPredLinkSE<-predTmp$se.fit
+    }
+    
+    predDfCFWeekly<-predDfCFWeekly %>%
+      mutate(
+        srPred=exp(srPredLink)
+      )
+    
+    obsOutcome<-sum(dat[match(predDfCFWeekly$week_num,dat$week_num),var],na.rm=T)
+    predOutcome<-sum(predDfCFWeekly$srPred[!is.na(dat[match(predDfCFWeekly$week_num,dat$week_num),var])])
+    predOutcomeLow<-sum(exp(predDfCFWeekly$srPredLink-qnorm(0.975)*predDfCFWeekly$srPredLinkSE)[!is.na(dat[match(predDfCFWeekly$week_num,dat$week_num),var])])
+    predOutcomeUpp<-sum(exp(predDfCFWeekly$srPredLink+qnorm(0.975)*predDfCFWeekly$srPredLinkSE)[!is.na(dat[match(predDfCFWeekly$week_num,dat$week_num),var])])
+    diffOutcome<-predOutcome-obsOutcome
+    diffOutcomeLow<-predOutcomeLow-obsOutcome
+    diffOutcomeUpp<-predOutcomeUpp-obsOutcome
+    
+    # if(doBS){
+    #   predOutcomeBS<-rep(0,B)
+    #   diffOutcomeBS<-rep(0,B)
+    #   
+    #   for(b in 1:B){
+    #     tmpPred<-predDfCFWeekly
+    #     u<-rnorm(n=1,mean=0,sd=1) # parametric bootstrapping; we sample a curve rather than individual points
+    #     tmpPred$srPred<-exp(predDfCFWeekly$srPredLink+u*predDfCFWeekly$srPredLinkSE)
+    #     
+    #     # predTmp<-try(silent=TRUE,exp(predict(modCFBS[[b]],newdata=tmpPred,type="link",se.fit=T)$fit))
+    #     # if(class(predTmp)!="try-error"){tmpPred$srPred<-predTmp}
+    #    
+    #     predOutcomeBS[b]<-sum(tmpPred$srPred[!is.na(dat[match(tmpPred$week_num,dat$week_num),var])])
+    #     diffOutcomeBS[b]<-predOutcomeBS[b]-obsOutcome
+    #   }
+    # }
+  
+    tmp<-summary(modSRcov2)$coefficients %>%
+      as.data.frame() %>%
+      mutate(
+        Estimate=exp(Estimate),
+        p.value=`Pr(>|z|)`,
+        rownum=1:n()
+      ) %>%
+      mutate(
+        Estimate=case_when(
+          rownum==1~1000*Estimate,
+          TRUE~Estimate
+        )
+      ) %>%
+      dplyr::select(c("Estimate","Std. Error","z value","p.value","rownum"))
+    
+    if(doBS){
+      print(
+        tmp %>%
+          dplyr::select(!rownum) %>%
+          kable(digits = 4,caption=paste(sep="","Summary of segmented regression analysis for ",tolower(varNameAnnot)," with two interruptions for the start of the second and third Covid-19 waves.\nThe estimates are exponentiated model coefficients, i.e. the intercept estimate is the baseline incidence rate (per 1,000 live births) and all other estimates are rate ratios associated with the different variables.\nStandard errors are for coefficient estimates on the link scale not exponentiated coefficients.\nThe difference in effects (on the link scale) of the second and third Covid-19 waves is ",format(nsmall=2,round(digits=2,covidWaves12Effect))," with 95% confidence interval (",paste(collapse=",",format(nsmall=2,round(digits=2,covidWaves12EffectCI))),").\nThe total difference in outcomes between the counterfactual scenario and observed outcomes from ",covidDate," to ",as.Date(predRange[2])," is ",round(digits=0,diffOutcome)," with 95% CI (",round(digits=0,diffOutcomeLow),", ",round(digits=0,diffOutcomeUpp),").")) %>%
+          kable_styling(full_width=FALSE) %>%
+          column_spec(5,bold=ifelse(tmp$p.value<0.05 & tmp$rownum>1,TRUE,FALSE))
+      )
+    }else{
+      print(
+        tmp %>%
+          dplyr::select(!rownum) %>%
+          kable(digits = 4,caption=paste(sep="","Summary of segmented regression analysis for ",tolower(varNameAnnot)," with two interruptions for the start of the second and third Covid-19 waves.")) %>%
+          kable_styling(full_width=FALSE) %>%
+          column_spec(5,bold=ifelse(tmp$p.value<0.05 & tmp$rownum>1,TRUE,FALSE))
+      )
+    }
+    
+    gCov2<-ggplot() +
+      geom_rect(aes(xmin=as_datetime(covid_week), xmax=as_datetime(covid2_week), ymin=-Inf, ymax=Inf), alpha=0.1) +
+      geom_rect(aes(xmin=as_datetime(covid2_week), xmax=max(c(as_datetime(dat$date),ymd_hm(predRange))), ymin=-Inf, ymax=Inf), alpha=0.2) +
+      geom_line(aes(y=1000*srPred/births, x=ymd_hms(date)), color="orange", data=predDfCF, lty=2) +
+      geom_ribbon(aes(ymax=1000*srPredUpp/births, ymin=1000*srPredLow/births, x=date), fill="orange", alpha=0.2, data=predDfCF) +
+      geom_line(aes(y=1000*srPred/births, x=ymd_hms(date)), color="steelblue", data=predDfCov2) +
+      geom_ribbon(aes(ymax=1000*srPredUpp/births, ymin=1000*srPredLow/births, x=date), fill="steelblue", alpha=0.3, data=predDfCov2) +
+      geom_point(aes(y=1000*sr/births, x=as_datetime(date)), data=dat, shape=1) +
+      ylab(ylabAnnot) +
+      xlab("Date") +
+      labs(title=paste(sep="",varNameAnnot," - ITS analysis"),
+           caption=paste(sep="","\n Dots = observed data.\n Line = fitted model (95% CI) with both step and slope changes due to the COVID-19 second and third waves.\n Shaded areas indicate the second (lighter shade of grey) and third (darker shade) COVID-19 waves in Malawi.\nThe solid blue curve shows the model fit for actual data.\nThe dashed orange line shows the counterfactual scenario of no second & third COVID-19 waves.\nModel AIC = ",round(digits=2,modSRcov2$aic),"; pseudo-R2 = ",round(digits=2,pseudoR2),".")) +
+      coord_cartesian(xlim=c(ymd_hms(predRange[1]), ymd_hms(predRange[2])),ylim=c(0.75*min(c(1000*dat$sr/dat$births,1000*predDfCF$srPred/predDfCF$births,1000*predDfCov2$srPred/predDfCov2$births,1000*predDfCov2$srPredLow/predDfCov2$births)),min(c(4*max(1000*dat$sr/dat$births),max(c(1.15*1000*dat$sr/dat$births,1000*predDfCF$srPred/predDfCF$births,1.15*1000*predDfCov2$srPred/predDfCov2$births,1.15*1000*predDfCov2$srPredUpp/predDfCov2$births)))))) +
+      scale_x_datetime(expand = c(0,0)) + 
+      theme_bw() +
+      theme(legend.title = element_blank())
+    
+    print(gCov2)
+
+    res<-list()
+    
+    res[[paste(sep="",varNameAnnot,"_modSRCov2")]]<-modSRcov2
+    res[[paste(sep="",varNameAnnot,"_graphCov2")]]<-gCov2
+    
+    res[["observedOutcome"]]<-obsOutcome
+    res[["predictedCounterfactualOutcome"]]<-predOutcome
+    res[["predictedCounterfactualOutcomeLow"]]<-predOutcomeLow
+    res[["predictedCounterfactualOutcomeUpp"]]<-predOutcomeUpp
+    res[["differenceCounterFactualObserved"]]<-diffOutcome
+    res[["differenceCounterFactualObservedLow"]]<-diffOutcomeLow
+    res[["differenceCounterFactualObservedUpp"]]<-diffOutcomeUpp
+    
+    res[["data"]]<-dat
+    res[["predDfCFWeekly"]]<-predDfCFWeekly
+    
+    # if(doBS){
+    #   res[["predictedCounterfactualOutcome_BS"]]<-predOutcomeBS
+    #   res[["differenceCounterFactualObserved_BS"]]<-diffOutcomeBS
+    # }
+    
+    return(res)
+  }else{
+    print("Unable to fit models.")
+    return(NULL)
+  }
+}
+
+
+modFunNoOffset<-function(dat,predRange=c("2020-07-26 00:00","2021-09-30 23:59"),var,varNameAnnot,ylabAnnot,B=1e3,doBS=TRUE,covidDate="2021-01-01"){
+  dat<-dat %>%
+    mutate(sr=get(var))
+  
+  modIntercept <-try(silent=TRUE,glm.nb(as.formula(paste(sep="",var," ~ 1")), data=dat))
+  
+  modCF <-try(silent=TRUE,glm.nb(as.formula(paste(sep="",var," ~ week_num")), data=dat %>% dplyr::filter(week_num<covid_week_num)))
+  # modSR <-glm.nb(as.formula(paste(sep="",var," ~ covid + week_num + week_num_postcovid")), data=dat)
+  # modSR.season <-glm.nb(as.formula(paste(sep="",var," ~ covid + week_num + week_num_postcovid + harmonic(week_num,2,52)")), data=dat)
+  modSRcov2 <-try(silent=TRUE,glm.nb(as.formula(paste(sep="",var," ~ covid + covid2 + week_num + week_num_postcovid + week_num_postcovid2")), data=dat))
+  # modSRcov3 <-glm.nb(as.formula(paste(sep="",var," ~ covid + covid2 + covid3 + week_num + week_num_postcovid + week_num_postcovid2 + week_num_postcovid3")), data=dat)
+  
+  if(class(modCF)!="try-error" & class(modSRcov2)!="try-error"){
+    pseudoR2<-1-logLik(modSRcov2)/logLik(modIntercept)
+    
+    if(doBS){
+      #tmp<-coef(modSRcov3)
+      tmp<-coef(modSRcov2)
+      covidWaves12Effect<-tmp["covid"]-tmp["covid2"]
+      covidWaves12EffectBS<-numeric(0)
+      
+      modCFBS<-list()
+      
+      for(b in 1:B){
+        modCFBS[[b]]<-try(stop("error"),silent=TRUE)
+        modBS<-try(stop("error"),silent=TRUE)
+        while(class(modCFBS[[b]])=="try-error" | class(modBS)=="try-error"){
+          datBS<-dat[sample(x=1:nrow(dat),size=nrow(dat),replace=TRUE),]
+          modCFBS[[b]]<-try(silent=TRUE,glm.nb(as.formula(paste(sep="",var," ~ week_num")), data=datBS %>% dplyr::filter(week_num<covid_week_num)))
+          #modBS <-glm.nb(as.formula(paste(sep="",var," ~ covid + covid2 + covid3 + week_num + week_num_postcovid + week_num_postcovid2 + week_num_postcovid3")), datBS)
+          modBS <-try(silent=TRUE,glm.nb(as.formula(paste(sep="",var," ~ covid + covid2 + week_num + week_num_postcovid + week_num_postcovid2")), datBS))
+        }
+        tmp<-coef(modBS)
+        covidWaves12EffectBS<-c(covidWaves12EffectBS,tmp["covid"]-tmp["covid2"])
+      }
+      
+      covidWaves12EffectCI<-quantile(covidWaves12EffectBS,probs=c(0.025,0.975))
+    }
+    
+    predDfCov2<-data.frame(
+      date=seq(ymd_hm(predRange[1]),ymd_hm(predRange[2]),by="hour")
+    ) %>%
+      mutate(week_num=(1:n() +7*24-1)/(7*24)) %>%
+      mutate(
+        covid=ifelse(week_num<covid_week_num,0,1),
+        covid2=ifelse(week_num<covid2_week_num,0,1)
+      ) %>%
+      mutate(
+        week_num_postcovid=ifelse(covid==0,0,week_num-covid_week_num),
+        week_num_postcovid2=ifelse(covid2==0,0,week_num-covid2_week_num)
+      ) %>%
+      as_tibble()
+    
+    predDfCov2<-predDfCov2 %>%
+      mutate(
+        srPredLink=NA,
+        srPredLinkSE=NA
+      )
+    
+    predTmp<-try(silent=TRUE,predict(modSRcov2,newdata=predDfCov2,type="link",se.fit=T))
+    if(class(predTmp)!="try-error"){
+      predDfCov2$srPredLink<-predTmp$fit
+      predDfCov2$srPredLinkSE<-predTmp$se.fit
+    }
+    
+    predDfCov2<-predDfCov2 %>%
+      mutate(
+        srPred=exp(srPredLink),
+        srPredLow=exp(srPredLink-qnorm(0.975)*srPredLinkSE),
+        srPredUpp=exp(srPredLink+qnorm(0.975)*srPredLinkSE)
+      )
+    
+    predDfCF<-data.frame(
+      date=seq(ymd_hm(predRange[1]),ymd_hm(predRange[2]),by="hour")
+    ) %>%
+      mutate(
+        week_num=(1:n() +7*24-1)/(7*24)
+      ) %>%
+      as_tibble() %>%
+      filter(week_num>=covid_week_num)
+    
+    predDfCF<-predDfCF %>%
+      mutate(
+        srPredLink=NA,
+        srPredLinkSE=NA
+      )
+    
+    predTmp<-try(silent=TRUE,predict(modCF,newdata=predDfCF,type="link",se.fit=T))
+    if(class(predTmp)!="try-error"){
+      predDfCF$srPredLink<-predTmp$fit
+      predDfCF$srPredLinkSE<-predTmp$se.fit
+    }
+    
+    predDfCF<-predDfCF %>%
+      mutate(
+        srPred=exp(srPredLink),
+        srPredLow=exp(srPredLink-qnorm(0.975)*srPredLinkSE),
+        srPredUpp=exp(srPredLink+qnorm(0.975)*srPredLinkSE)
+      )
+    
+    predDfCFWeekly<-data.frame(
+      date=seq(ymd_hm(predRange[1]),ymd_hm(predRange[2]),by="weeks")
+    ) %>%
+      mutate(week_num=1:n()) %>%
+      as_tibble() %>%
+      filter(week_num>=covid_week_num)
+    
+    predDfCFWeekly<-predDfCFWeekly %>%
+      mutate(
+        srPredLink=NA,
+        srPredLinkSE=NA
+      )
+    
+    predTmp<-try(silent=TRUE,predict(modCF,newdata=predDfCFWeekly,type="link",se.fit=T))
+    if(class(predTmp)!="try-error"){
+      predDfCFWeekly$srPredLink<-predTmp$fit
+      predDfCFWeekly$srPredLinkSE<-predTmp$se.fit
+    }
+    
+    predDfCFWeekly<-predDfCFWeekly %>%
+      mutate(
+        srPred=exp(srPredLink)
+      )
+    
+    obsOutcome<-sum(dat[match(predDfCFWeekly$week_num,dat$week_num),var],na.rm=T)
+    predOutcome<-sum(predDfCFWeekly$srPred[!is.na(dat[match(predDfCFWeekly$week_num,dat$week_num),var])])
+    predOutcomeLow<-sum(exp(predDfCFWeekly$srPredLink-qnorm(0.975)*predDfCFWeekly$srPredLinkSE)[!is.na(dat[match(predDfCFWeekly$week_num,dat$week_num),var])])
+    predOutcomeUpp<-sum(exp(predDfCFWeekly$srPredLink+qnorm(0.975)*predDfCFWeekly$srPredLinkSE)[!is.na(dat[match(predDfCFWeekly$week_num,dat$week_num),var])])
+    diffOutcome<-predOutcome-obsOutcome
+    diffOutcomeLow<-predOutcomeLow-obsOutcome
+    diffOutcomeUpp<-predOutcomeUpp-obsOutcome
+    
+    # if(doBS){
+    #   predOutcomeBS<-rep(0,B)
+    #   diffOutcomeBS<-rep(0,B)
+    #   
+    #   for(b in 1:B){
+    #     tmpPred<-predDfCFWeekly
+    #     u<-rnorm(n=1,mean=0,sd=1) # parametric bootstrapping; we sample a curve rather than individual points
+    #     tmpPred$srPred<-exp(predDfCFWeekly$srPredLink+u*predDfCFWeekly$srPredLinkSE)
+    #     #tmpPred$srPred<-exp(rnorm(n=nrow(predDfCFWeekly),mean=predDfCFWeekly$srPredLink,sd=predDfCFWeekly$srPredLinkSE))# parametric bootstrapping
+    #     
+    #     # predTmp<-try(silent=TRUE,exp(predict(modCFBS[[b]],newdata=tmpPred,type="link",se.fit=T)$fit))
+    #     # if(class(predTmp)!="try-error"){tmpPred$srPred<-predTmp}
+    #     
+    #     predOutcomeBS[b]<-sum(tmpPred$srPred[!is.na(dat[match(tmpPred$week_num,dat$week_num),var])])
+    #     diffOutcomeBS[b]<-predOutcomeBS[b]-obsOutcome
+    #   }
+    # }
+    
+    #print(summary(modSRcov2))
+    tmp<-summary(modSRcov2)$coefficients %>%
+      as.data.frame() %>%
+      mutate(
+        Estimate=exp(Estimate),
+        p.value=`Pr(>|z|)`,
+        rownum=1:n()
+      ) %>%
+      dplyr::select(c("Estimate","Std. Error","z value","p.value","rownum"))
+    
+    if(doBS){
+      print(
+        tmp %>%
+          dplyr::select(!rownum) %>%
+          kable(digits = 4,caption=paste(sep="","Summary of segmented regression analysis for ",tolower(varNameAnnot)," with two interruptions for the start of the second and third Covid-19 waves.\nThe estimates are exponentiated model coefficients, i.e. the intercept estimate is the baseline weekly incidence rate and all other estimates are rate ratios associated with the different variables.\nStandard errors are for coefficient estimates on the link scale not exponentiated coefficients.\nThe difference in effects (on the link scale) of the second and third Covid-19 waves is ",format(nsmall=2,round(digits=2,covidWaves12Effect))," with 95% confidence interval (",paste(collapse=",",format(nsmall=2,round(digits=2,covidWaves12EffectCI))),").\nThe total difference in outcomes between the counterfactual scenario and observed outcomes from ",covidDate," to ",as.Date(predRange[2])," is ",round(digits=0,diffOutcome)," with 95% CI (",round(digits=0,diffOutcomeLow),", ",round(digits=0,diffOutcomeUpp),").")) %>%
+          kable_styling(full_width=FALSE) %>%
+          column_spec(5,bold=ifelse(tmp$p.value<0.05 & tmp$rownum>1,TRUE,FALSE))
+      )
+    }else{
+      print(
+        tmp %>%
+          dplyr::select(!rownum) %>%
+          kable(digits = 4,caption=paste(sep="","Summary of segmented regression analysis for ",tolower(varNameAnnot)," with three interruptions for the start of the second and third Covid-19 waves.")) %>%
+          kable_styling(full_width=FALSE) %>%
+          column_spec(5,bold=ifelse(tmp$p.value<0.05 & tmp$rownum>1,TRUE,FALSE))
+      )
+    }
+    
+    gCov2<-ggplot() +
+      geom_rect(aes(xmin=as_datetime(covid_week), xmax=as_datetime(covid2_week), ymin=-Inf, ymax=Inf), alpha=0.1) +
+      geom_rect(aes(xmin=as_datetime(covid2_week), xmax=max(c(as_datetime(dat$date),ymd_hm(predRange))), ymin=-Inf, ymax=Inf), alpha=0.2) +
+      geom_line(aes(y=srPred, x=ymd_hms(date)), color="orange", data=predDfCF, lty=2) +
+      geom_ribbon(aes(ymax=srPredUpp, ymin=srPredLow, x=date), fill="orange", alpha=0.2, data=predDfCF) +
+      geom_line(aes(y=srPred, x=ymd_hms(date)), color="steelblue", data=predDfCov2) +
+      geom_ribbon(aes(ymax=srPredUpp, ymin=srPredLow, x=date), fill="steelblue", alpha=0.3, data=predDfCov2) +
+      geom_point(aes(y=sr, x=as_datetime(date)), data=dat, shape=1) +
+      ylab(ylabAnnot) +
+      xlab("Date") +
+      labs(title=paste(sep="",varNameAnnot," - ITS analysis"),
+           caption=paste(sep="","\n Dots = observed data.\n Line = fitted model (95% CI) with both step and slope changes due to the second and third COVID-19 waves.\n Shaded areas indicate the second (lighter shade of grey) and third (darker shade) COVID-19 waves in Malawi.\nThe solid blue curve shows the model fit for actual data.\nThe dashed orange line shows the counterfactual scenario of no second & third COVID-19 waves.\nModel AIC = ",round(digits=2,modSRcov2$aic),"; pseudo-R2 = ",round(digits=2,pseudoR2),".")) +
+      coord_cartesian(xlim=c(ymd_hms(predRange[1]), ymd_hms(predRange[2])),ylim=c(0.75*min(c(dat$sr,predDfCF$srPred,predDfCov2$srPred,predDfCov2$srPredLow)),min(c(max(4*dat$sr),max(c(1.15*dat$sr,predDfCF$srPred,1.15*predDfCov2$srPred,1.15*predDfCov2$srPredUpp)))))) +
+      scale_x_datetime(expand = c(0,0)) + 
+      theme_bw() +
+      theme(legend.title = element_blank())
+    
+    print(gCov2)
+    
+    res<-list()
+    
+    res[[paste(sep="",varNameAnnot,"_modSRCov2")]]<-modSRcov2
+    res[[paste(sep="",varNameAnnot,"_graphCov2")]]<-gCov2
+    
+    res[["observedOutcome"]]<-obsOutcome
+    res[["predictedCounterfactualOutcome"]]<-predOutcome
+    res[["predictedCounterfactualOutcomeLow"]]<-predOutcomeLow
+    res[["predictedCounterfactualOutcomeUpp"]]<-predOutcomeUpp
+    res[["differenceCounterFactualObserved"]]<-diffOutcome
+    res[["differenceCounterFactualObservedLow"]]<-diffOutcomeLow
+    res[["differenceCounterFactualObservedUpp"]]<-diffOutcomeUpp
+    
+    res[["data"]]<-dat
+    res[["predDfCFWeekly"]]<-predDfCFWeekly
+    
+    # if(doBS){
+    #   res[["predictedCounterfactualOutcome_BS"]]<-predOutcomeBS
+    #   res[["differenceCounterFactualObserved_BS"]]<-diffOutcomeBS
+    # }
+    
+    return(res)
+  }else{
+    print("Unable to fit models.")
+    return(NULL)
+  }
+}
+```
+
+```{r}
+set.seed(20220518)
+mod<-list()
+```
+
+### Nationwide
+
+#### Births
+
+```{r, results='asis'}
+mod$births<-modFunNoOffset(dat=ms01_weekly,predRange=c(paste(sep="",datePlotStart," 00:00"),paste(sep="",datePlotEnd," 23:59")),var="births",varNameAnnot="Weekly live birth rate",ylabAnnot="Live births (per week)")
+
+df<-data.frame(
+  week_num=mod$births$data$week_num,
+  residuals=residuals(mod$births$`Weekly live birth rate_modSRCov2`,type="deviance"),
+  fitted_values=predict(newdata=mod$births$data,object=mod$births$`Weekly live birth rate_modSRCov2`)
+)
+
+df %>% ggplot(mapping=aes(x=fitted_values,y=residuals)) +
+  geom_point() +
+  theme_light() +
+  xlab("fitted values") +
+  ylab("deviance residuals")
+
+acf(df$res)
+pacf(df$res)
+```
+
+#### Maternal deaths
+
+```{r, results='asis'}
+mod$mds<-modFunBirthOffset(dat=ms01_weekly,predRange=c(paste(sep="",datePlotStart," 00:00"),paste(sep="",datePlotEnd," 23:59")),var="mds",varNameAnnot="Maternal death rate",ylabAnnot="Maternal deaths (per 1,000 live births)")
+
+df<-data.frame(
+  week_num=mod$mds$data$week_num,
+  residuals=residuals(mod$mds$`Maternal death rate_modSRCov2`,type="deviance"),
+  fitted_values=predict(newdata=mod$mds$data,object=mod$mds$`Maternal death rate_modSRCov2`)
+)
+
+df %>% ggplot(mapping=aes(x=fitted_values,y=residuals)) +
+  geom_point() +
+  theme_light() +
+  xlab("fitted values") +
+  ylab("deviance residuals")
+
+acf(df$res)
+pacf(df$res)
+```
+
+#### Neonatal deaths
+
+```{r, results='asis'}
+mod$nds<-modFunBirthOffset(dat=ms01_weekly,predRange=c(paste(sep="",datePlotStart," 00:00"),paste(sep="",datePlotEnd," 23:59")),var="nds",varNameAnnot="Neonatal death rate",ylabAnnot="Neonatal deaths (per 1,000 live births)")
+
+df<-data.frame(
+  week_num=mod$nds$data$week_num,
+  residuals=residuals(mod$nds$`Neonatal death rate_modSRCov2`,type="deviance"),
+  fitted_values=predict(newdata=mod$nds$data,object=mod$nds$`Neonatal death rate_modSRCov2`)
+)
+
+df %>% ggplot(mapping=aes(x=fitted_values,y=residuals)) +
+  geom_point() +
+  theme_light() +
+  xlab("fitted values") +
+  ylab("deviance residuals")
+
+acf(df$res)
+pacf(df$res)
+```
+
+#### Still births (all)
+
+```{r, results='asis'}
+mod$sbs<-modFunBirthOffset(dat=ms01_weekly,predRange=c(paste(sep="",datePlotStart," 00:00"),paste(sep="",datePlotEnd," 23:59")),var="sbs",varNameAnnot="Stillbirth rate",ylabAnnot="Stillbirths (per 1,000 live births)")
+
+df<-data.frame(
+  week_num=mod$sbs$data$week_num,
+  residuals=residuals(mod$sbs$`Stillbirth rate_modSRCov2`,type="deviance"),
+  fitted_values=predict(newdata=mod$sbs$data,object=mod$sbs$`Stillbirth rate_modSRCov2`)
+)
+
+df %>% ggplot(mapping=aes(x=fitted_values,y=residuals)) +
+  geom_point() +
+  theme_light() +
+  xlab("fitted values") +
+  ylab("deviance residuals")
+
+acf(df$res)
+pacf(df$res)
+```
+
+##### Fresh still births
+
+```{r, results='asis'}
+mod$fsbs<-modFunBirthOffset(dat=ms01_weekly,predRange=c(paste(sep="",datePlotStart," 00:00"),paste(sep="",datePlotEnd," 23:59")),var="fsbs",varNameAnnot="Fresh stillbirth rate",ylabAnnot="Fresh stillbirths (per 1,000 live births)")
+
+df<-data.frame(
+  week_num=mod$fsbs$data$week_num,
+  residuals=residuals(mod$fsbs$`Fresh stillbirth rate_modSRCov2`,type="deviance"),
+  fitted_values=predict(newdata=mod$fsbs$data,object=mod$fsbs$`Fresh stillbirth rate_modSRCov2`)
+)
+
+df %>% ggplot(mapping=aes(x=fitted_values,y=residuals)) +
+  geom_point() +
+  theme_light() +
+  xlab("fitted values") +
+  ylab("deviance residuals")
+
+acf(df$res)
+pacf(df$res)
+```
+
+##### Macerated still births
+
+```{r, results='asis'}
+mod$msbs<-modFunBirthOffset(dat=ms01_weekly,predRange=c(paste(sep="",datePlotStart," 00:00"),paste(sep="",datePlotEnd," 23:59")),var="msbs",varNameAnnot="Macerated stillbirth rate",ylabAnnot="Macerated stillbirths (per 1,000 live births)")
+
+df<-data.frame(
+  week_num=mod$msbs$data$week_num,
+  residuals=residuals(mod$msbs$`Macerated stillbirth rate_modSRCov2`,type="deviance"),
+  fitted_values=predict(newdata=mod$msbs$data,object=mod$msbs$`Macerated stillbirth rate_modSRCov2`)
+)
+
+df %>% ggplot(mapping=aes(x=fitted_values,y=residuals)) +
+  geom_point() +
+  theme_light() +
+  xlab("fitted values") +
+  ylab("deviance residuals")
+
+acf(df$res)
+pacf(df$res)
+```
+
+#### Antenatal clinics
+
+```{r, results='asis'}
+mod$ancs<-modFunNoOffset(dat=ms01_weekly,predRange=c(paste(sep="",datePlotStart," 00:00"),paste(sep="",datePlotEnd," 23:59")),var="ancs",varNameAnnot="Weekly antenatal clinic visit rate",ylabAnnot="Antenatal clinic visits (per week)")
+
+df<-data.frame(
+  week_num=mod$ancs$data$week_num,
+  residuals=residuals(mod$ancs$`Weekly antenatal clinic visit rate_modSRCov2`,type="deviance"),
+  fitted_values=predict(newdata=mod$ancs$data,object=mod$ancs$`Weekly antenatal clinic visit rate_modSRCov2`)
+)
+
+df %>% ggplot(mapping=aes(x=fitted_values,y=residuals)) +
+  geom_point() +
+  theme_light() +
+  xlab("fitted values") +
+  ylab("deviance residuals")
+
+acf(df$res)
+pacf(df$res)
+```
+
+#### Postnatal clinics
+
+```{r, results='asis'}
+ms01_weekly_pnc<-ms01_weekly %>%
+  mutate(
+    covid=ifelse(date<ymd("2021-01-01")+lubridate::weeks(6),0,1),
+    covid2=ifelse(date<ymd("2021-06-20")+lubridate::weeks(6),0,1),
+    covid3=ifelse(date<ymd("2021-12-10")+lubridate::weeks(6),0,1)
+  )
+
+covid_week_num_orig<-covid_week_num
+covid2_week_num_orig<-covid2_week_num
+
+covid_week_num <- min(ms01_weekly_pnc$week_num[ms01_weekly_pnc$covid==1])
+covid2_week_num <- min(ms01_weekly_pnc$week_num[ms01_weekly_pnc$covid2==1])
+
+ms01_weekly_pnc<-ms01_weekly_pnc %>%
+  mutate(
+    week_num_postcovid=ifelse(covid==0,0,week_num-covid_week_num+1),
+    week_num_postcovid2=ifelse(covid2==0,0,week_num-covid2_week_num+1),
+    week_num_postcovid3=ifelse(covid3==0,0,week_num-covid3_week_num+1)
+  )
+
+mod$pncs<-modFunNoOffset(dat=ms01_weekly_pnc,predRange=c(paste(sep="",datePlotStart," 00:00"),paste(sep="",datePlotEnd," 23:59")),var="pncs",varNameAnnot="Weekly postnatal clinic visit rate",ylabAnnot="Postnatal clinic visits (per week)")
+
+df<-data.frame(
+  week_num=mod$pncs$data$week_num,
+  residuals=residuals(mod$pncs$`Weekly postnatal clinic visit rate_modSRCov2`,type="deviance"),
+  fitted_values=predict(newdata=mod$pncs$data,object=mod$pncs$`Weekly postnatal clinic visit rate_modSRCov2`)
+)
+
+df %>% ggplot(mapping=aes(x=fitted_values,y=residuals)) +
+  geom_point() +
+  theme_light() +
+  xlab("fitted values") +
+  ylab("deviance residuals")
+
+acf(df$res)
+pacf(df$res)
+
+covid_week_num<-covid_week_num_orig
+covid2_week_num<-covid2_week_num_orig
+```
+
+
+```{r}
+modAll<-mod
+```
+
+### Summarising the above (for some of the outcomes)
+
+```{r}
+sumMods<-function(var){
+  tabSum<-data.frame(
+    var=var,
+    model=c("Malawi (all)"),
+    Observed=NA,
+    Counterfactual=NA,
+    DifferenceAbs=NA,
+    DifferenceRel=NA
+  )
+  
+  if(!is.null(modAll[[var]])){
+    tabSum[tabSum$model=="Malawi (all)",c("Observed","Counterfactual","DifferenceAbs","DifferenceRel")]<-c(
+      modAll[[var]]$observedOutcome,
+      paste(sep="",round(modAll[[var]]$predictedCounterfactualOutcome)," (",round(modAll[[var]]$predictedCounterfactualOutcomeLow),", ",round(modAll[[var]]$predictedCounterfactualOutcomeUpp),")"),
+      paste(sep="",round(modAll[[var]]$differenceCounterFactualObserved)," (",round(modAll[[var]]$differenceCounterFactualObservedLow),", ",round(modAll[[var]]$differenceCounterFactualObservedUpp),")"),
+      paste(sep="",format(nsmall=2,round(digits=2,100*modAll[[var]]$differenceCounterFactualObserved/modAll[[var]]$observedOutcome)),"% (",format(nsmall=2,round(digits=2,100*modAll[[var]]$differenceCounterFactualObservedLow/modAll[[var]]$observedOutcome)),"%, ",format(nsmall=2,round(digits=2,100*modAll[[var]]$differenceCounterFactualObservedUpp/modAll[[var]]$observedOutcome)),"%)")
+    )
+  }
+  
+  return(tabSum)
+}
+
+tabSum_births<-sumMods("births")
+tabSum_mds<-sumMods("mds")
+tabSum_nds<-sumMods("nds")
+tabSum_fsbs<-sumMods("fsbs")
+tabSum_msbs<-sumMods("msbs")
+tabSum_ancs<-sumMods("ancs")
+tabSum_pncs<-sumMods("pncs")
+
+tabSum<-rbind(
+  tabSum_births,
+  tabSum_mds,
+  tabSum_nds,
+  tabSum_fsbs,
+  tabSum_msbs,
+  tabSum_ancs,
+  tabSum_pncs
+)
+
+tabSum %>%
+  dplyr::select(!c(var,model)) %>%
+  knitr::kable(col.names=c("Observed","Predicted (95% CI)","Difference (absolute)","Difference (relative)")) %>%
+  kableExtra::kable_styling(full_width = FALSE) %>%
+  pack_rows(index = table(fct_inorder(tabSum[,"var"])))
+
+write.csv(tabSum,row.names=FALSE,file=paste(sep="",outDir,"summaryTable_observedVsCounterfactual_",dateStr,".csv"))
+
+save(list=c("modAll"),file=paste(sep="",outDir,"allModels_",dateStr,".RData"))
+```
+
+
+## Quality-of-care indicators
+
+### Nationwide
+
+#### Number of doctors
+
+```{r, results='asis'}
+mod$numdocs<-modFunNoOffset(dat=ms01_weekly,predRange=c(paste(sep="",datePlotStart," 00:00"),paste(sep="",datePlotEnd," 23:59")),var="numdocs",varNameAnnot="Weekly number of doctors",ylabAnnot="Number of doctors (per week)")
+```
+
+#### Number of clinical officers
+
+```{r, results='asis'}
+mod$numcos<-modFunNoOffset(dat=ms01_weekly,predRange=c(paste(sep="",datePlotStart," 00:00"),paste(sep="",datePlotEnd," 23:59")),var="numdocs",varNameAnnot="Weekly number of doctors",ylabAnnot="Number of doctors (per week)")
+```
+
+#### Number of nurses
+
+```{r, results='asis'}
+mod$numnurs<-modFunNoOffset(dat=ms01_weekly,predRange=c(paste(sep="",datePlotStart," 00:00"),paste(sep="",datePlotEnd," 23:59")),var="numdocs",varNameAnnot="Weekly number of doctors",ylabAnnot="Number of doctors (per week)")
+```
+
+For Likert-scale variables, we first compute weighting scores per facility (based on total births over entire period - proxy for facility size), then combine these as either quantitative scores or to compute proportions per level (possibly combining some levels).
+
+Only weeks for which all facilities reported birth numbers were used to derive the weights.
+
+Note that facility `Bwaila` is by far the largest (20,995 births) and `KCH` is quite small (2,718 births) -- is this correct?
+
+```{r weights}
+tmp<-ms01 %>%
+  dplyr::filter(ymd(data_date)>=ymd(datePlotStart) & ymd(data_date)<=ymd(datePlotEnd)) %>%
+  dplyr::group_by(data_date) %>%
+  dplyr::summarise(totWeeklyBirths=sum(birth)) %>%
+  dplyr::filter(!is.na(totWeeklyBirths))
+
+dates<-tmp$data_date
+rm(tmp)
+
+sizeWeights<-ms01 %>%
+  dplyr::filter(data_date %in% dates) %>%
+  dplyr::group_by(facility_name) %>%
+  dplyr::summarise(
+    totBirths=sum(birth)
+  ) %>%
+  mutate(weight=totBirths/sum(totBirths))
+```
+
+```{r ppeScores}
+ppeScoresWeekly<-ms01 %>%
+  dplyr::mutate(date=floor_date(unit="weeks",ymd(data_date))) %>%
+  dplyr::filter(ymd(date)>=ymd(datePlotStart) & ymd(date)<=ymd(datePlotEnd)) %>%
+  dplyr::group_by(facility_name,date) %>%
+  dplyr::summarise(
+    ppe1 = sum(ppe1==0 | ppe1==1,na.rm=TRUE)/sum(!is.na(ppe1)),
+    ppe2 = sum(ppe2==0 | ppe2==1,na.rm=TRUE)/sum(!is.na(ppe2)),
+    ppe3 = sum(ppe3==0 | ppe3==1,na.rm=TRUE)/sum(!is.na(ppe3)),
+    ppe4 = sum(ppe4==0 | ppe4==1,na.rm=TRUE)/sum(!is.na(ppe4)),
+    ppe5 = sum(ppe5==0 | ppe5==1,na.rm=TRUE)/sum(!is.na(ppe5)),
+    .groups="drop"
+  ) %>%
+  dplyr::mutate(weight=sizeWeights$weight[match(facility_name,sizeWeights$facility_name)]) %>%
+  dplyr::group_by(date) %>%
+  dplyr::summarise(
+    ppe1NoneOrLowProp=sum(weight*ppe1),
+    ppe2NoneOrLowProp=sum(weight*ppe2),
+    ppe3NoneOrLowProp=sum(weight*ppe3),
+    ppe4NoneOrLowProp=sum(weight*ppe4),
+    ppe5NoneOrLowProp=sum(weight*ppe5),
+    ppeNoneOrLowProp=sum(weight*(ppe1+ppe2+ppe3+ppe4+ppe5)/5),
+    .groups="drop"
+  )
+
+ppeScoresWeekly<-ppeScoresWeekly[order(ppeScoresWeekly$date),] %>% 
+  mutate(
+    week_num=weekDict$week_num[match(date,weekDict$week)],
+    covid=ifelse(date<"2021-01-01",0,1),
+    covid2=ifelse(date<"2021-06-20",0,1),
+    covid3=ifelse(date<"2021-12-10",0,1)
+  )
+
+covid_week<-min(ppeScoresWeekly$date[ppeScoresWeekly$covid==1])
+covid2_week<-min(ppeScoresWeekly$date[ppeScoresWeekly$covid2==1])
+covid3_week<-min(ppeScoresWeekly$date[ppeScoresWeekly$covid3==1])
+covid_week_num<-min(ppeScoresWeekly$week_num[ppeScoresWeekly$covid==1])
+covid2_week_num<-min(ppeScoresWeekly$week_num[ppeScoresWeekly$covid2==1])
+covid3_week_num<-min(ppeScoresWeekly$week_num[ppeScoresWeekly$covid3==1])
+
+ppeScoresWeekly<-ppeScoresWeekly %>%
+  mutate(
+    week_num_postcovid=ifelse(covid==0,0,week_num-covid_week_num+1),
+    week_num_postcovid2=ifelse(covid2==0,0,week_num-covid2_week_num+1),
+    week_num_postcovid3=ifelse(covid3==0,0,week_num-covid3_week_num+1)
+  )
+
+
+#mod$ppe<-modFunNoOffset(dat=ppeScoresWeekly,predRange=c(paste(sep="",datePlotStart," 00:00"),paste(sep="",datePlotEnd," 23:59")),var="ppeNoneOrLowProp",varNameAnnot="Proportion of out of stock or limited stock PPE supplies.",ylabAnnot="Proportion of out of stock or limited stock PPE supplies (per week).",checkForLowEvents=FALSE)
+
+ppeScoresWeekly %>%
+  pivot_longer(cols=c(ppe1NoneOrLowProp,ppe2NoneOrLowProp,ppe3NoneOrLowProp,ppe4NoneOrLowProp,ppe5NoneOrLowProp,ppeNoneOrLowProp),names_to="metric",values_to="prop") %>%
+  ggplot(mapping=aes(ymd(date),y=prop)) + 
+  geom_bar(stat="identity") +
+  ylab("proportion (none or low stock)") +
+  xlab("date") +
+  xlim(c(ymd(datePlotStart),ymd(datePlotEnd))) +
+  labs(title="Weekly reported deaths.",caption="Data were aggregated by calendar week, with the start date of each week identifying the week.\nOrange dashed lines indicate the chosen interruption dates.") +
+  geom_vline(xintercept = ymd("2021-01-01"),lty=2,lwd=1,col="orange") +
+  geom_vline(xintercept = ymd("2021-06-20"),lty=2,lwd=1,col="orange") +
+  facet_wrap(~metric,nrow = 6)
+```
+
+
+#### QoC table
+
+For this table we list the proportion of health facilities that are experiencing either low or no stock during different phases of the epidemic.
+In addition to the start dates of waves 2 (2021-01-01) and 3 (2021-06-20), we also need to specify end dates for these. From visual inspection of epidemic curve: wave 2 end = 2021-04-17 and wave 3 end = 2021-10-09.
+
+```{r}
+gEpiWithEnds<-epiCurveJHP.long %>%
+  dplyr::filter(Date>=ymd(datePlotStart) & Date<=ymd(datePlotEnd)) %>%
+  ggplot() +
+  geom_bar(mapping=aes(x=Date,y=count),stat="identity") +
+  geom_line(mapping=aes(x=Date,y=MA14),col="steelblue",lwd=1) +
+  geom_vline(xintercept = ymd("2021-01-01"),lty=2,lwd=1,col="orange") +
+  geom_vline(xintercept = ymd("2021-04-17"),lty=2,lwd=1,col="yellowgreen") +
+  geom_vline(xintercept = ymd("2021-06-20"),lty=2,lwd=1,col="orange") +
+  geom_vline(xintercept = ymd("2021-10-09"),lty=2,lwd=1,col="yellowgreen") +
+  geom_vline(xintercept = ymd("2021-12-10"),lty=2,lwd=1,col="orange") +
+  labs(title="Daily confirmed COVID-19 cases (top) and deaths (bottom) in Malawi. Data from JHU CSSE.",caption="Grey bars show daily counts, blue lines show centered 14-day moving averages.\nShown in orange are the proposed time points for the interruptions in the segmented time series analysis: 2021-01-01 and 2021-06-20.\nIn yello-green are the proposed end dates for wave ends: 2021-04-17 and 2021-10-09.\n2021-01-01 is a round date and which has the advantage of not conflating anything with the Christmas season.\nFurther, given this date is slightly after the start of the second wave, it allows for a lagged response.\nSimilarly 2021-06-20 and 2021-12-10 were chosen for the third and fourth waves.") +
+  xlab("Date") +
+  ylab("Total confirmed daily count.") +
+  xlim(c(ymd(datePlotStart),ymd(datePlotEnd))) +
+  facet_wrap(~type,nrow=2,scales = "free_y")
+
+pdf(width=20,height=20,file=paste(sep="",outDir,"EpiCurveByDistrict_WholeOfMalawi_",dateStr,".pdf"))
+print(gEpi)
+dev.off()
+```
+
+
+For each QoC we report the percentage of health centre - weeks (i.e. a health centre report from 1 week counts as 1, health centre reports for 3 weeks from 2 health centres as 6 etc) that had recorded no or limited supply of an item, respectively when a service / provision was not or only rarely available.
+
+
+```{r}
+ms01_weeklyQoC<-ms01 %>% 
+  mutate(date=floor_date(unit="weeks",ymd(data_date))) %>%
+  dplyr::filter(ymd(date) %in% seq(ymd(datePlotStart),ymd(datePlotEnd),by="days")) %>%
+  group_by(facility_name,date) %>%
+  summarise(
+    ppe1=min(ppe1,na.rm=T),
+    ppe2=min(ppe2,na.rm=T),
+    ppe3=min(ppe3,na.rm=T),
+    ppe4=min(ppe4,na.rm=T),
+    ppe5=min(ppe5,na.rm=T),
+    ppe6=min(ppe6,na.rm=T),
+    
+    foutc1=min(foutc1,na.rm=T),
+    foutc2=min(foutc2,na.rm=T),
+    foutc3=min(foutc3,na.rm=T),
+    foutc5=min(foutc5,na.rm=T),
+    foutc6=min(foutc6,na.rm=T),
+    foutc7=min(foutc7,na.rm=T),
+    foutc9=min(foutc9,na.rm=T),
+    
+    foutc11=min(foutc11,na.rm=T),
+    foutc10=min(foutc10,na.rm=T),
+    foutc12=min(foutc12,na.rm=T),
+    foutc13=min(foutc13,na.rm=T),
+    foutc14=min(foutc14,na.rm=T),
+    foutc15=min(foutc15,na.rm=T),
+    foutc16=min(foutc16,na.rm=T),
+    foutc17=min(foutc17,na.rm=T),
+    .groups="drop")
+
+ms01_weeklyQoC[,-c(1:2)][abs(ms01_weeklyQoC[,-c(1:2)])==Inf]<-NA
+
+ms01_weeklyQoC<-ms01_weeklyQoC %>%
+  group_by(date) %>%
+  summarise(
+    ppe1_prop=mean(ppe1<2,na.rm=T),
+    ppe1_k=sum(ppe1<2,na.rm=T),
+    ppe1_n=sum(!is.na(ppe1)),
+    ppe2_prop=mean(ppe2<2,na.rm=T),
+    ppe2_k=sum(ppe2<2,na.rm=T),
+    ppe2_n=sum(!is.na(ppe2)),
+    ppe3_prop=mean(ppe3<2,na.rm=T),
+    ppe3_k=sum(ppe3<2,na.rm=T),
+    ppe3_n=sum(!is.na(ppe3)),
+    ppe4_prop=mean(ppe4<2,na.rm=T),
+    ppe4_k=sum(ppe4<2,na.rm=T),
+    ppe4_n=sum(!is.na(ppe4)),
+    ppe5_prop=mean(ppe5<2,na.rm=T),
+    ppe5_k=sum(ppe5<2,na.rm=T),
+    ppe5_n=sum(!is.na(ppe5)),
+    ppe6_prop=mean(ppe6<2,na.rm=T),
+    ppe6_k=sum(ppe6<2,na.rm=T),
+    ppe6_n=sum(!is.na(ppe6)),
+
+    foutc1_prop=mean(foutc1<2,na.rm=T),
+    foutc1_k=sum(foutc1<2,na.rm=T),
+    foutc1_n=sum(!is.na(foutc1)),
+    foutc2_prop=mean(foutc2<2,na.rm=T),
+    foutc2_k=sum(foutc2<2,na.rm=T),
+    foutc2_n=sum(!is.na(foutc2)),
+    foutc3_prop=mean(foutc3<2,na.rm=T),
+    foutc3_k=sum(foutc3<2,na.rm=T),
+    foutc3_n=sum(!is.na(foutc3)),
+    foutc5_prop=mean(foutc5<2,na.rm=T),
+    foutc5_k=sum(foutc5<2,na.rm=T),
+    foutc5_n=sum(!is.na(foutc5)),
+    foutc6_prop=mean(foutc6<2,na.rm=T),
+    foutc6_k=sum(foutc6<2,na.rm=T),
+    foutc6_n=sum(!is.na(foutc6)),
+    foutc7_prop=mean(foutc7<2,na.rm=T),
+    foutc7_k=sum(foutc7<2,na.rm=T),
+    foutc7_n=sum(!is.na(foutc7)),
+    foutc9_prop=mean(foutc9<2,na.rm=T),
+    foutc9_k=sum(foutc9<2,na.rm=T),
+    foutc9_n=sum(!is.na(foutc9)),
+    
+    foutc11_prop=mean(foutc11<2,na.rm=T),
+    foutc11_k=sum(foutc11<2,na.rm=T),
+    foutc11_n=sum(!is.na(foutc11)),
+    foutc10_prop=mean(foutc10<2,na.rm=T),
+    foutc10_k=sum(foutc10<2,na.rm=T),
+    foutc10_n=sum(!is.na(foutc10)),
+    foutc12_prop=mean(foutc12<2,na.rm=T),
+    foutc12_k=sum(foutc12<2,na.rm=T),
+    foutc12_n=sum(!is.na(foutc12)),
+    foutc13_prop=mean(foutc13<2,na.rm=T),
+    foutc13_k=sum(foutc13<2,na.rm=T),
+    foutc13_n=sum(!is.na(foutc13)),
+    foutc14_prop=mean(foutc14<2,na.rm=T),
+    foutc14_k=sum(foutc14<2,na.rm=T),
+    foutc14_n=sum(!is.na(foutc14)),
+    foutc15_prop=mean(foutc15<2,na.rm=T),
+    foutc15_k=sum(foutc15<2,na.rm=T),
+    foutc15_n=sum(!is.na(foutc15)),
+    foutc16_prop=mean(foutc16<2,na.rm=T),
+    foutc16_k=sum(foutc16<2,na.rm=T),
+    foutc16_n=sum(!is.na(foutc16)),
+    foutc17_prop=mean(foutc17<2,na.rm=T),
+    foutc17_k=sum(foutc17<2,na.rm=T),
+    foutc17_n=sum(!is.na(foutc17)),
+  .groups="drop") %>%
+  mutate(
+    period = factor(case_when(
+      ymd(date) %in% seq(ymd("2020-01-01"),ymd("2020-12-31"),by="days") ~ "Period_1",
+      ymd(date) %in% seq(ymd("2021-01-01"),ymd("2021-04-17"),by="days") ~ "Period_2",
+      ymd(date) %in% seq(ymd("2021-04-18"),ymd("2021-06-19"),by="days") ~ "Period_3",
+      ymd(date) %in% seq(ymd("2021-06-20"),ymd("2021-10-09"),by="days") ~ "Period_4",
+      ymd(date) %in% seq(ymd("2021-10-10"),ymd("2021-12-09"),by="days") ~ "Period_5"
+    ))
+  )
+
+ms01_weeklyQoC_k<-ms01_weeklyQoC %>%
+  dplyr::select(c(date,period,contains("_k"))) %>%
+  tidyr::pivot_longer(cols=contains("_k"),names_to="QoC",values_to="k") %>%
+  dplyr::mutate(QoC=gsub(QoC,pattern="_k",replacement=""))
+
+ms01_weeklyQoC_n<-ms01_weeklyQoC %>%
+  dplyr::select(c(date,period,contains("_n"))) %>%
+  tidyr::pivot_longer(cols=contains("_n"),names_to="QoC",values_to="n") %>%
+  dplyr::mutate(QoC=gsub(QoC,pattern="_n",replacement=""))
+
+ms01_weeklyQoC_summary<-dplyr::full_join(ms01_weeklyQoC_k,ms01_weeklyQoC_n,by=c("date","period","QoC")) %>%
+  dplyr::group_by(period,QoC) %>%
+  dplyr::summarise(
+    k=sum(k),
+    n=sum(n),
+    .groups="drop"
+  ) %>%
+  dplyr::mutate(
+    prop=k/n
+  ) %>%
+  tidyr::pivot_wider(names_from=period,values_from=c(k,n,prop))
+  
+if(length(unique(ms01_weeklyQoC_summary$n_Period_1))==1 & length(unique(ms01_weeklyQoC_summary$n_Period_2))==1 & length(unique(ms01_weeklyQoC_summary$n_Period_3))==1 & length(unique(ms01_weeklyQoC_summary$n_Period_4))==1 & length(unique(ms01_weeklyQoC_summary$n_Period_5))==1){
+  nList<-list()
+  for(i in 1:5){nList[[i]]<-as.numeric(unique(ms01_weeklyQoC_summary[,paste(sep="_","n_Period",i)]))}
+  
+  ms01_weeklyQoC_summary<-ms01_weeklyQoC_summary %>%
+    dplyr::mutate(
+      formatted_Period_1 = paste(sep="",k_Period_1," (",format(nsmall=1,trim=T,round(digits=1,100*prop_Period_1)),"%)"),
+      formatted_Period_2 = paste(sep="",k_Period_2," (",format(nsmall=1,trim=T,round(digits=1,100*prop_Period_2)),"%)"),
+      formatted_Period_3 = paste(sep="",k_Period_3," (",format(nsmall=1,trim=T,round(digits=1,100*prop_Period_3)),"%)"),
+      formatted_Period_4 = paste(sep="",k_Period_4," (",format(nsmall=1,trim=T,round(digits=1,100*prop_Period_4)),"%)"),
+      formatted_Period_5 = paste(sep="",k_Period_5," (",format(nsmall=1,trim=T,round(digits=1,100*prop_Period_5)),"%)")
+    ) %>%
+    dplyr::select(c(QoC,contains("formatted")))
+}
+
+orderMat<-data.frame(
+  short=c(paste(sep="","foutc",c(1,2,3,5,6,7,9,11,10,12,13,14,15,16,17)),paste(sep="","ppe",1:6)),
+  long=c("Handwashing stations with soap",
+         "Patients are being screened for COVID before entering",
+         "Alcohol-based hand rub for healthcare workers on every ward",
+         "Working thermometers on every maternity ward",
+         "Working oxygen satuartion machines on every maternity ward",
+         "Paper partogram for each woman in labour",
+         "Companion of choice for each women during labour/birth",
+         "Adequately skilled birth attendants",
+         "Timely transfer via referral system when required",
+         "Person capable of emergency caesaerean section",
+         "Functioning operating theatre for emergency surgery",
+         "Adequate blood supply for emergency transfusion",
+         "OxyContin for management of third stage labour for all women",
+         "Intravenous ampicillin or penicillin",
+         "Intravenous cephalosporin antibiotics",
+         "Gloves",
+         "Surgical masks",
+         "N95 masks",
+         "Visors",
+         "Gowns",
+         "Waterproof aprons"
+         )
+)
+
+ms01_weeklyQoC_summary<-ms01_weeklyQoC_summary %>%
+  dplyr::mutate(QoC_text=orderMat$long[match(QoC,orderMat$short)])
+
+ms01_weeklyQoC_summary<-left_join(orderMat,ms01_weeklyQoC_summary,by=c("short" = "QoC")) %>%
+  dplyr::select(!long)
+
+colnames(ms01_weeklyQoC_summary)<-c(
+  "QoC",
+  paste(sep="_","Period_1_20200906_20201231",nList[[1]]),
+  paste(sep="_","Period_2_20210101_20210417",nList[[2]]),
+  paste(sep="_","Period_3_20210418_20210619",nList[[3]]),
+  paste(sep="_","Period_4_20210620_20211009",nList[[4]]),
+  paste(sep="_","Period_5_20211010_20211209",nList[[5]]),
+  "QoC_text"
+)
+
+write.csv(ms01_weeklyQoC_summary,row.names=F,file=paste(sep="",outDir,"summaryTable_QoC_",dateStr,".csv"))
+
+ms01_weeklyQoC_summary %>%
+  dplyr::select(c(QoC_text,contains("Period"))) %>%
+  kable(caption = "Quality-of-care indicators during 5 intervals.\nAudit measures show the frequencies and percentages of services and providions that are not or only seldomly available.\nPPE measures show the frequencies and percentages when PPE equipment was out of or in low stock.",col.names = c("Indicator",paste(sep="",c("Before wave 2","During wave 2","Between waves 2 & 3","During wave 3","Between waves 3 & 4"),"(n = ",unlist(nList),")"))) %>%
+  kable_styling(full_width = FALSE) %>%
+  pack_rows(group_label ="Audit 1",1,7) %>%
+  pack_rows(group_label ="Audit 2",8,15) %>%
+  pack_rows(group_label ="PPE",16,21)
+```
