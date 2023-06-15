@@ -13,7 +13,7 @@ $$
 \begin{align}
 \log(E[Y|t_1,t_2]) =& b_0 + b_1 \cdot t \\
  & + b_2 \cdot I(t-t_1) + b_3 \cdot (t-t_1)_+ \\
- & + b_4 \cdot I(t-t_2)
+ & + b_4 \cdot I(t-t_2) + b_5 \cdot (t-t_2)_+
 \end{align}
 $$
 
