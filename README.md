@@ -15,6 +15,7 @@ $$
 
 where
 * $Y$ is the response variable,
-* $I(x) = 0$ if $x \leq 0$ and 1 if $x>0$ and $(x)_+ = 0$ if $x \leq 0$ and x if $x>0$,
+* $I(x) = 0$ if $x \leq 0$ and 1 if $x>0$
+* $(x)_+ = 0$ if $x \leq 0$ and x if $x>0$,
 * $Y|t_1,t_2$ follows a negative binomial distribution and
 * $b_1, b_2, b_3, b_4, b_5$ are regression coefficients to be estimated. 
