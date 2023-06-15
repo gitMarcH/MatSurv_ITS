@@ -4,7 +4,7 @@ This repo contains the R markdown code used for the segmented regression analyse
 
 The analysis code is made available under an MIT license - please refer to the license file in this repository for full details.
 
-EID requires authors to not include equations and describe the model equations in words. While this makes the methods section more accessible to less mathematically inclined readers, it can leave the actual model details ambiguous.
+The EID journal requires authors to not include equations and describe the model equations in words. While this makes the methods section more accessible to less mathematically inclined readers, it can leave the actual model details ambiguous.
 To avoid this, we provide here the model equations for the segmented regression models we used:
 
 Mathematically, our modelling framework can be written as:
